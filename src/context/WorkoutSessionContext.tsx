@@ -139,6 +139,7 @@ export function WorkoutSessionProvider({ children }: { children: React.ReactNode
 
   const hydratedUserIdRef = useRef<string | null>(null);
   const firedRestEndRef = useRef<number | null>(null);
+  const inFlightSaveRef = useRef<Promise<WorkoutSessionRecord> | null>(null);
   const defaultRestSeconds = settings.default_rest_seconds || 90;
 
   useEffect(() => {
@@ -818,6 +819,10 @@ export function WorkoutSessionProvider({ children }: { children: React.ReactNode
   );
 
   const finishAndSaveWorkout = useCallback(async (): Promise<WorkoutSessionRecord> => {
+    if (inFlightSaveRef.current) {
+      return inFlightSaveRef.current;
+    }
+
     if (!user || !session) {
       throw new Error('No active workout session to save.');
     }
@@ -839,58 +844,64 @@ export function WorkoutSessionProvider({ children }: { children: React.ReactNode
       throw new Error(msg);
     }
 
-    setSaving(true);
-    try {
-      const endMs = Date.now();
-      const prHighlights = computeSessionPRSummary(session.exercises, prBaselines);
+    const runSave = (async () => {
+      setSaving(true);
+      try {
+        const endMs = Date.now();
+        const prHighlights = computeSessionPRSummary(session.exercises, prBaselines);
 
-      const saved = await saveWorkoutSession(user.id, {
-        client_request_id: session.sessionId,
-        plan_id: session.planId,
-        workout_name: session.workoutName,
-        workout_date: session.workoutDate,
-        started_at: new Date(session.startedAtMs).toISOString(),
-        ended_at: new Date(endMs).toISOString(),
-        duration_seconds: computeSessionElapsedSeconds(session, endMs),
-        session_notes: session.sessionNotes,
-        exercises: session.exercises,
-      });
-
-      if (prHighlights.length > 0) {
-        persistSessionPRSummary(user.id, {
-          sessionId: saved.id,
-          clientRequestId: saved.client_request_id,
-          workoutName: saved.workout_name,
-          workoutDate: saved.workout_date,
-          achievedAt: new Date().toISOString(),
-          highlights: prHighlights,
+        const saved = await saveWorkoutSession(user.id, {
+          client_request_id: session.sessionId,
+          plan_id: session.planId,
+          workout_name: session.workoutName,
+          workout_date: session.workoutDate,
+          started_at: new Date(session.startedAtMs).toISOString(),
+          ended_at: new Date(endMs).toISOString(),
+          duration_seconds: computeSessionElapsedSeconds(session, endMs),
+          session_notes: session.sessionNotes,
+          exercises: session.exercises,
         });
+
+        if (prHighlights.length > 0) {
+          persistSessionPRSummary(user.id, {
+            sessionId: saved.id,
+            clientRequestId: saved.client_request_id,
+            workoutName: saved.workout_name,
+            workoutDate: saved.workout_date,
+            achievedAt: new Date().toISOString(),
+            highlights: prHighlights,
+          });
+        }
+
+        clearPersistedWorkoutSession(user.id);
+        firedRestEndRef.current = null;
+        setPendingRecovery(false);
+        setSession(null);
+        void triggerHaptic('heavy');
+        showToast(
+          prHighlights.length > 0
+            ? `Workout saved with ${prHighlights.length} PR${prHighlights.length > 1 ? 's' : ''}!`
+            : 'Workout saved.',
+          'success'
+        );
+
+        void fetchAllTimeExercisePRs(user.id)
+          .then(setPrBaselines)
+          .catch(() => {});
+
+        return saved;
+      } catch (err) {
+        const msg = `Save failed: ${(err as Error).message}. Your sets and timer remain safely preserved — tap Save again to retry.`;
+        setSaveError(msg);
+        throw new Error(msg);
+      } finally {
+        inFlightSaveRef.current = null;
+        setSaving(false);
       }
+    })();
 
-      clearPersistedWorkoutSession(user.id);
-      firedRestEndRef.current = null;
-      setPendingRecovery(false);
-      setSession(null);
-      void triggerHaptic('heavy');
-      showToast(
-        prHighlights.length > 0
-          ? `Workout saved with ${prHighlights.length} PR${prHighlights.length > 1 ? 's' : ''}!`
-          : 'Workout saved.',
-        'success'
-      );
-
-      void fetchAllTimeExercisePRs(user.id)
-        .then(setPrBaselines)
-        .catch(() => {});
-
-      return saved;
-    } catch (err) {
-      const msg = `Save failed: ${(err as Error).message}. Your sets and timer remain safely preserved — tap Save again to retry.`;
-      setSaveError(msg);
-      throw new Error(msg);
-    } finally {
-      setSaving(false);
-    }
+    inFlightSaveRef.current = runSave;
+    return runSave;
   }, [prBaselines, session, showToast, user]);
 
   const elapsedSeconds = useMemo(

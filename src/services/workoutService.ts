@@ -174,17 +174,6 @@ function enrichSessionsWithPhase1Meta(
   });
 }
 
-function isColumnMissingError(err: unknown): boolean {
-  const msg = String((err as { message?: string })?.message ?? err ?? '').toLowerCase();
-  const code = String((err as { code?: string })?.code ?? '');
-  return (
-    code === '42703' ||
-    code === 'PGRST204' ||
-    msg.includes('column') ||
-    msg.includes('schema cache')
-  );
-}
-
 export interface ActiveSetDraft {
   set_number: number;
   weight_kg: number;
@@ -573,9 +562,95 @@ function buildLocalSessionRecord(userId: string, payload: SaveWorkoutPayload): W
   };
 }
 
+function isUuidLike(value: string | null | undefined): boolean {
+  if (!value) return false;
+  return /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i.test(value.trim());
+}
+
+function isRpcFunctionMissingError(err: unknown): boolean {
+  const msg = String((err as { message?: string })?.message ?? err ?? '').toLowerCase();
+  const code = String((err as { code?: string })?.code ?? '').toUpperCase();
+  return (
+    code === 'PGRST202' ||
+    code === '42883' ||
+    msg.includes('could not find the function') ||
+    (msg.includes('function') && msg.includes('does not exist'))
+  );
+}
+
+function normalizeWorkoutSessionRecord(raw: unknown): WorkoutSessionRecord {
+  const row = raw as Record<string, unknown>;
+  const rawExercises = Array.isArray(row.workout_session_exercises)
+    ? (row.workout_session_exercises as Array<Record<string, unknown>>)
+    : [];
+
+  return {
+    id: String(row.id),
+    user_id: String(row.user_id),
+    client_request_id: String(row.client_request_id),
+    plan_id: row.plan_id ? String(row.plan_id) : null,
+    workout_name: String(row.workout_name ?? 'Training Session'),
+    workout_date: String(row.workout_date),
+    started_at: String(row.started_at),
+    ended_at: row.ended_at ? String(row.ended_at) : null,
+    duration_seconds: Number(row.duration_seconds) || 0,
+    total_volume_kg: Number(row.total_volume_kg) || 0,
+    session_notes: String(row.session_notes ?? ''),
+    status: row.status === 'in_progress' ? 'in_progress' : 'completed',
+    created_at: String(row.created_at ?? new Date().toISOString()),
+    workout_session_exercises: rawExercises
+      .map((ex) => {
+        const rawSets = Array.isArray(ex.workout_sets)
+          ? (ex.workout_sets as Array<Record<string, unknown>>)
+          : [];
+        return {
+          id: String(ex.id),
+          user_id: String(ex.user_id),
+          session_id: String(ex.session_id),
+          exercise_id: ex.exercise_id ? String(ex.exercise_id) : null,
+          custom_exercise_id: ex.custom_exercise_id ? String(ex.custom_exercise_id) : null,
+          exercise_name: String(ex.exercise_name),
+          exercise_category: String(ex.exercise_category ?? 'Full body'),
+          sort_order: Number(ex.sort_order) || 0,
+          rest_seconds: Number(ex.rest_seconds) || 90,
+          exercise_notes: String(ex.exercise_notes ?? ''),
+          superset_group: ex.superset_group ? String(ex.superset_group) : null,
+          workout_sets: rawSets
+            .map((st) => ({
+              id: String(st.id),
+              user_id: String(st.user_id),
+              session_exercise_id: String(st.session_exercise_id),
+              set_number: Number(st.set_number) || 1,
+              weight_kg: Number(st.weight_kg) || 0,
+              reps: Number(st.reps) || 0,
+              is_completed: Boolean(st.is_completed),
+              rest_seconds: Number(st.rest_seconds) || 90,
+              set_type: (st.set_type as SetType | undefined) ?? 'normal',
+              rpe: st.rpe !== null && st.rpe !== undefined ? Number(st.rpe) : null,
+            }))
+            .sort((a, b) => a.set_number - b.set_number),
+        };
+      })
+      .sort((a, b) => a.sort_order - b.sort_order),
+  };
+}
+
+function saveWorkoutSessionLocally(
+  userId: string,
+  payload: SaveWorkoutPayload
+): WorkoutSessionRecord {
+  const existingLocals = loadLocalWorkoutSessions(userId);
+  const dup = existingLocals.find((s) => s.client_request_id === payload.client_request_id);
+  if (dup) return dup;
+  const localRecord = buildLocalSessionRecord(userId, payload);
+  saveLocalWorkoutSessions(userId, [localRecord, ...existingLocals]);
+  return localRecord;
+}
+
 /**
- * Saves a completed workout session to Supabase PostgreSQL idempotently using client_request_id.
- * Falls back to local device persistence only when Supabase tables have not been created yet.
+ * Atomically and idempotently saves a completed workout session (parent + all exercises + all sets)
+ * via PostgreSQL RPC `save_workout_session_atomic` using `client_request_id`.
+ * Falls back to local device persistence ONLY when core workout tables have not been created yet.
  */
 export async function saveWorkoutSession(
   userId: string,
@@ -583,145 +658,101 @@ export async function saveWorkoutSession(
 ): Promise<WorkoutSessionRecord> {
   const supabase = requireClient();
 
-  // Always persist Phase 1 rich metadata locally so superset_group, set_type & RPE survive even before SQL migration runs
+  if (!isUuidLike(payload.client_request_id)) {
+    throw new Error('Invalid workout session identifier (client_request_id must be a UUID).');
+  }
+  if (!payload.exercises || payload.exercises.length === 0) {
+    throw new Error('Add at least one exercise before saving your workout.');
+  }
+
+  // Keep Phase 1 rich metadata locally as a secondary cache for offline/legacy compatibility
   savePhase1SessionMeta(userId, payload.client_request_id, payload.exercises);
 
-  // Check if already persisted from an earlier retry with the same client_request_id
-  const { data: existing, error: lookupErr } = await supabase
-    .from('workout_sessions')
-    .select('*, workout_session_exercises(*, workout_sets(*))')
-    .eq('user_id', userId)
-    .eq('client_request_id', payload.client_request_id)
-    .maybeSingle();
+  const exercisesPayload = payload.exercises.map((ex, idx) => ({
+    exercise_id:
+      isUuidLike(ex.exercise_id) && !ex.exercise_id!.startsWith('a0000000-')
+        ? ex.exercise_id
+        : null,
+    custom_exercise_id: isUuidLike(ex.custom_exercise_id) ? ex.custom_exercise_id : null,
+    exercise_name: ex.exercise_name.trim(),
+    exercise_category: ex.exercise_category,
+    sort_order: idx + 1,
+    rest_seconds: Math.max(0, Math.round(Number(ex.rest_seconds) || 90)),
+    exercise_notes: ex.exercise_notes.trim(),
+    superset_group: ex.superset_group ?? null,
+    sets: ex.sets.map((s, sIdx) => ({
+      set_number: sIdx + 1,
+      weight_kg: Number(s.weight_kg) || 0,
+      reps: Math.max(0, Math.round(Number(s.reps) || 0)),
+      is_completed: Boolean(s.is_completed),
+      rest_seconds: Math.max(0, Math.round(Number(s.rest_seconds || ex.rest_seconds || 90))),
+      set_type: s.set_type ?? 'normal',
+      rpe: typeof s.rpe === 'number' ? s.rpe : null,
+    })),
+  }));
 
-  if (lookupErr) {
-    if (isSchemaMissingError(lookupErr)) {
-      const existingLocals = loadLocalWorkoutSessions(userId);
-      const dup = existingLocals.find(
-        (s) => s.client_request_id === payload.client_request_id
+  const expectedSetCount = exercisesPayload.reduce((sum, ex) => sum + ex.sets.length, 0);
+
+  const { data, error: rpcErr } = await supabase.rpc('save_workout_session_atomic', {
+    p_user_id: userId,
+    p_client_request_id: payload.client_request_id,
+    p_plan_id: isUuidLike(payload.plan_id) ? payload.plan_id : null,
+    p_workout_name: payload.workout_name.trim() || 'Training Session',
+    p_workout_date: payload.workout_date,
+    p_started_at: payload.started_at,
+    p_ended_at: payload.ended_at,
+    p_duration_seconds: Math.max(0, Math.round(payload.duration_seconds)),
+    p_session_notes: payload.session_notes.trim(),
+    p_exercises: exercisesPayload,
+  });
+
+  if (rpcErr) {
+    if (isRpcFunctionMissingError(rpcErr)) {
+      // Distinguish "DB schema not created at all yet" from "tables exist, 000007 migration missing"
+      const { error: tableCheckErr } = await supabase
+        .from('workout_sessions')
+        .select('id')
+        .limit(1);
+
+      if (tableCheckErr && isSchemaMissingError(tableCheckErr)) {
+        return saveWorkoutSessionLocally(userId, payload);
+      }
+
+      throw new Error(
+        'Atomic workout save RPC (public.save_workout_session_atomic) is not installed in Supabase yet. Run supabase/migrations/20261118000007_atomic_save_workout_rpc.sql in Supabase SQL Editor, then tap Save again.'
       );
-      if (dup) return dup;
-      const localRecord = buildLocalSessionRecord(userId, payload);
-      saveLocalWorkoutSessions(userId, [localRecord, ...existingLocals]);
-      return localRecord;
-    }
-    throw new Error(lookupErr.message);
-  }
-  if (existing) {
-    return enrichSessionsWithPhase1Meta(userId, [existing as WorkoutSessionRecord])[0];
-  }
-
-  let totalVolumeKg = 0;
-  for (const ex of payload.exercises) {
-    for (const s of ex.sets) {
-      if (s.is_completed && s.weight_kg >= 0 && s.reps > 0) {
-        totalVolumeKg += Number(s.weight_kg) * Number(s.reps);
-      }
-    }
-  }
-  totalVolumeKg = Math.round(totalVolumeKg * 100) / 100;
-
-  const { data: session, error: sessionErr } = await supabase
-    .from('workout_sessions')
-    .insert({
-      user_id: userId,
-      client_request_id: payload.client_request_id,
-      plan_id: payload.plan_id,
-      workout_name: payload.workout_name.trim() || 'Training Session',
-      workout_date: payload.workout_date,
-      started_at: payload.started_at,
-      ended_at: payload.ended_at,
-      duration_seconds: Math.max(0, Math.round(payload.duration_seconds)),
-      total_volume_kg: totalVolumeKg,
-      session_notes: payload.session_notes.trim(),
-      status: 'completed',
-    })
-    .select('*')
-    .single();
-
-  if (sessionErr || !session) {
-    throw new Error(sessionErr?.message ?? 'Failed to create workout session in cloud.');
-  }
-
-  for (let i = 0; i < payload.exercises.length; i++) {
-    const ex = payload.exercises[i];
-    const validDbExerciseId =
-      ex.exercise_id && !ex.exercise_id.startsWith('a0000000-') ? ex.exercise_id : null;
-
-    const baseExerciseRow = {
-      user_id: userId,
-      session_id: session.id,
-      exercise_id: validDbExerciseId,
-      custom_exercise_id: ex.custom_exercise_id,
-      exercise_name: ex.exercise_name,
-      exercise_category: ex.exercise_category,
-      sort_order: i + 1,
-      rest_seconds: ex.rest_seconds,
-      exercise_notes: ex.exercise_notes.trim(),
-    };
-
-    let { data: exRow, error: exErr } = await supabase
-      .from('workout_session_exercises')
-      .insert({
-        ...baseExerciseRow,
-        superset_group: ex.superset_group ?? null,
-      })
-      .select('*')
-      .single();
-
-    if (exErr && isColumnMissingError(exErr)) {
-      const retry = await supabase
-        .from('workout_session_exercises')
-        .insert(baseExerciseRow)
-        .select('*')
-        .single();
-      exRow = retry.data;
-      exErr = retry.error;
     }
 
-    if (exErr || !exRow) {
-      throw new Error(exErr?.message ?? `Failed to save exercise ${ex.exercise_name}`);
+    if (isSchemaMissingError(rpcErr)) {
+      return saveWorkoutSessionLocally(userId, payload);
     }
 
-    if (ex.sets.length > 0) {
-      const baseSets = ex.sets.map((s, idx) => ({
-        user_id: userId,
-        session_exercise_id: exRow.id,
-        set_number: idx + 1,
-        weight_kg: Number(s.weight_kg) || 0,
-        reps: Math.max(0, Math.round(Number(s.reps) || 0)),
-        is_completed: Boolean(s.is_completed),
-        rest_seconds: s.rest_seconds || ex.rest_seconds || 90,
-      }));
-
-      const richSets = baseSets.map((row, idx) => ({
-        ...row,
-        set_type: ex.sets[idx].set_type ?? 'normal',
-        rpe: typeof ex.sets[idx].rpe === 'number' ? ex.sets[idx].rpe : null,
-      }));
-
-      let { error: setsErr } = await supabase.from('workout_sets').insert(richSets);
-      if (setsErr && isColumnMissingError(setsErr)) {
-        const retrySets = await supabase.from('workout_sets').insert(baseSets);
-        setsErr = retrySets.error;
-      }
-      if (setsErr) {
-        throw new Error(setsErr.message);
-      }
-    }
+    throw new Error(rpcErr.message);
   }
 
-  const { data: verified, error: verifyErr } = await supabase
-    .from('workout_sessions')
-    .select('*, workout_session_exercises(*, workout_sets(*))')
-    .eq('id', session.id)
-    .single();
-
-  if (verifyErr || !verified) {
-    throw new Error(verifyErr?.message ?? 'Cloud write verification failed.');
+  if (!data || typeof data !== 'object') {
+    throw new Error('Cloud write verification failed: empty response from atomic workout save.');
   }
 
-  return enrichSessionsWithPhase1Meta(userId, [verified as WorkoutSessionRecord])[0];
+  const normalized = normalizeWorkoutSessionRecord(data);
+  const returnedExCount = normalized.workout_session_exercises?.length ?? 0;
+  const returnedSetCount = (normalized.workout_session_exercises ?? []).reduce(
+    (sum, ex) => sum + (ex.workout_sets?.length ?? 0),
+    0
+  );
+
+  if (
+    !normalized.id ||
+    normalized.status !== 'completed' ||
+    returnedExCount < exercisesPayload.length ||
+    returnedSetCount < expectedSetCount
+  ) {
+    throw new Error(
+      'Cloud write verification failed: incomplete workout hierarchy returned from database.'
+    );
+  }
+
+  return enrichSessionsWithPhase1Meta(userId, [normalized])[0];
 }
 
 export async function fetchWorkoutSessions(

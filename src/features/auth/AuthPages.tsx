@@ -27,6 +27,7 @@ function AuthShell({
   const navigate = useNavigate();
   const { isConfigured } = useAuth();
   const [configOpen, setConfigOpen] = useState(false);
+  const showDevOverride = import.meta.env.DEV && !isConfigured;
 
   return (
     <div
@@ -42,14 +43,16 @@ function AuthShell({
           <ArrowLeft className="w-4 h-4" />
           <span>Back</span>
         </button>
-        <button
-          type="button"
-          onClick={() => setConfigOpen(true)}
-          className="min-h-[44px] px-3 rounded-xl border border-white/10 text-xs text-zinc-300 hover:text-white inline-flex items-center gap-1.5"
-        >
-          <Database className="w-3.5 h-3.5" style={{ color: isConfigured ? 'var(--accent-primary)' : '#F59E0B' }} />
-          <span>{isConfigured ? 'Cloud Ready' : 'Configure Cloud'}</span>
-        </button>
+        {showDevOverride && (
+          <button
+            type="button"
+            onClick={() => setConfigOpen(true)}
+            className="min-h-[44px] px-3 rounded-xl border border-white/10 text-xs text-zinc-300 hover:text-white inline-flex items-center gap-1.5"
+          >
+            <Database className="w-3.5 h-3.5 text-amber-400" />
+            <span>Dev: Configure Cloud</span>
+          </button>
+        )}
       </header>
 
       <main className="flex-1 w-full max-w-md mx-auto px-5 py-4 flex flex-col justify-center">
@@ -60,17 +63,23 @@ function AuthShell({
 
         {!isConfigured && (
           <div className="mb-5">
-            <ErrorBanner
-              message="Supabase is not connected yet. Connect your Supabase project URL and Anon Key before signing in."
-              onRetry={() => setConfigOpen(true)}
-            />
+            {showDevOverride ? (
+              <ErrorBanner
+                message="Development mode: VITE_SUPABASE_URL / VITE_SUPABASE_ANON_KEY are not set in .env."
+                onRetry={() => setConfigOpen(true)}
+              />
+            ) : (
+              <ErrorBanner message="Authentication service is temporarily unavailable. Please try again later." />
+            )}
           </div>
         )}
 
         {children}
       </main>
 
-      <CloudConfigModal open={configOpen} onClose={() => setConfigOpen(false)} />
+      {showDevOverride && (
+        <CloudConfigModal open={configOpen} onClose={() => setConfigOpen(false)} />
+      )}
     </div>
   );
 }

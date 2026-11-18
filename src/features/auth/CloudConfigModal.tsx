@@ -30,13 +30,18 @@ export function CloudConfigModal({
   const [anonKey, setAnonKey] = useState(current.anonKey);
   const [error, setError] = useState('');
 
+  // Never render manual Supabase configuration UI in production builds.
+  if (!import.meta.env.DEV) {
+    return null;
+  }
+
   const handleSave = (e: React.FormEvent) => {
     e.preventDefault();
     setError('');
     try {
       saveRuntimeSupabaseConfig(url, anonKey);
       refreshConfigStatus();
-      showToast('Supabase project connected. You can now sign up or sign in.', 'success');
+      showToast('Development Supabase override saved.', 'success');
       onClose();
     } catch (err) {
       setError((err as Error).message);
@@ -48,11 +53,11 @@ export function CloudConfigModal({
     setUrl('');
     setAnonKey('');
     refreshConfigStatus();
-    showToast('Runtime Supabase connection cleared.', 'info');
+    showToast('Development runtime override cleared.', 'info');
   };
 
   return (
-    <ModalSheet open={open} onClose={onClose} title="Supabase Cloud Configuration">
+    <ModalSheet open={open} onClose={onClose} title="Developer Supabase Override">
       <div className="space-y-5">
         <div className="rounded-xl border border-white/10 bg-white/[0.03] p-4 space-y-2">
           <div className="flex items-center gap-2 text-sm font-semibold text-white">
@@ -61,16 +66,16 @@ export function CloudConfigModal({
               {current.source === 'env'
                 ? 'Connected via environment variables (.env)'
                 : current.source === 'runtime'
-                  ? 'Connected via runtime configuration'
-                  : 'Supabase credentials required'}
+                  ? 'Connected via development runtime override'
+                  : 'Local development environment missing .env'}
             </span>
           </div>
           <p className="text-xs text-zinc-400 leading-relaxed">
-            GYM PAGLU uses real Supabase Authentication and PostgreSQL Row Level Security. Enter
-            your Supabase Project URL and Anon Key below, or set{' '}
+            Production builds automatically use{' '}
             <code className="text-zinc-200">VITE_SUPABASE_URL</code> and{' '}
-            <code className="text-zinc-200">VITE_SUPABASE_ANON_KEY</code> in{' '}
-            <code className="text-zinc-200">.env</code>.
+            <code className="text-zinc-200">VITE_SUPABASE_ANON_KEY</code> from{' '}
+            <code className="text-zinc-200">.env</code>. This override is only available in local
+            development when <code className="text-zinc-200">.env</code> is not configured.
           </p>
         </div>
 
@@ -88,7 +93,7 @@ export function CloudConfigModal({
 
           <FormField
             label="Supabase Anon Public Key"
-            hint="Safe client key protected by PostgreSQL RLS policies"
+            hint="Public anon key only — never enter a service_role key"
           >
             <input
               type="text"
@@ -105,7 +110,7 @@ export function CloudConfigModal({
           <div className="flex flex-wrap items-center gap-3 pt-1">
             <PrimaryButton type="submit" className="flex-1">
               <KeyRound className="w-4 h-4" />
-              Connect Project
+              Save Dev Override
             </PrimaryButton>
             {current.source === 'runtime' && (
               <SecondaryButton onClick={handleClear}>
@@ -117,13 +122,15 @@ export function CloudConfigModal({
         </form>
 
         <div className="border-t border-white/[0.08] pt-4 space-y-2">
-          <h4 className="text-xs font-semibold text-zinc-200">Required Cloud Setup Steps</h4>
+          <h4 className="text-xs font-semibold text-zinc-200">Recommended Setup</h4>
           <ul className="space-y-1.5 text-xs text-zinc-400">
             <li className="flex items-start gap-2">
               <CheckCircle2 className="w-3.5 h-3.5 text-zinc-500 shrink-0 mt-0.5" />
               <span>
-                Run <code className="text-zinc-300">supabase/migrations/20261118000001_initial_schema.sql</code> and{' '}
-                <code className="text-zinc-300">20261118000002_seed_catalogs.sql</code> in Supabase SQL Editor.
+                Copy <code className="text-zinc-300">.env.example</code> to{' '}
+                <code className="text-zinc-300">.env</code> and set{' '}
+                <code className="text-zinc-300">VITE_SUPABASE_URL</code> and{' '}
+                <code className="text-zinc-300">VITE_SUPABASE_ANON_KEY</code>.
               </span>
             </li>
             <li className="flex items-start gap-2">

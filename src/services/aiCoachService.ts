@@ -1,4 +1,8 @@
-import { getSupabaseClient, getSupabaseConfig, getSupabaseProjectRef } from '../lib/supabase';
+import {
+  getInitializedSupabaseConnection,
+  getSupabaseClient,
+  getSupabaseProjectRef,
+} from '../lib/supabase';
 import type { AIConversation, AIMessage, AIProviderPref, AITone } from '../types/database';
 
 function requireClient() {
@@ -279,12 +283,12 @@ export async function streamCoachMessage(params: {
   onDelta?: (chunk: string) => void;
 }): Promise<SendCoachMessageResult> {
   const { session } = await ensureFreshSession();
-  const cfg = getSupabaseConfig();
-  if (cfg.source === 'none') {
+  const conn = getInitializedSupabaseConnection();
+  if (!conn) {
     throw new Error('Supabase is not configured.');
   }
 
-  const endpoint = `${cfg.url.replace(/\/+$/, '')}/functions/v1/ai-coach`;
+  const endpoint = `${conn.url.replace(/\/+$/, '')}/functions/v1/ai-coach`;
   let response: Response;
 
   try {
@@ -294,7 +298,7 @@ export async function streamCoachMessage(params: {
         'Content-Type': 'application/json',
         Accept: 'text/event-stream, application/json',
         Authorization: `Bearer ${session.access_token}`,
-        apikey: cfg.anonKey,
+        apikey: conn.anonKey,
       },
       body: JSON.stringify({
         action: 'chat',

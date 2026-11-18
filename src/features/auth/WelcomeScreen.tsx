@@ -11,6 +11,8 @@ export function WelcomeScreen() {
   const [configOpen, setConfigOpen] = useState(false);
   const [imgError, setImgError] = useState(false);
 
+  const showDevOverride = import.meta.env.DEV && !isConfigured;
+
   return (
     <div
       className="min-h-dvh w-full flex flex-col justify-between safe-top-pad safe-bottom-pad"
@@ -21,14 +23,16 @@ export function WelcomeScreen() {
         <span className="font-display text-xl font-bold tracking-tight text-white whitespace-nowrap shrink-0">
           GYM <span style={{ color: 'var(--accent-primary)' }}>PAGLU</span>
         </span>
-        <button
-          type="button"
-          onClick={() => setConfigOpen(true)}
-          className="min-h-[44px] px-3.5 py-2 rounded-xl border border-white/10 bg-white/[0.03] text-xs font-medium text-zinc-300 hover:text-white inline-flex items-center gap-2 whitespace-nowrap shrink-0"
-        >
-          <Database className="w-3.5 h-3.5" style={{ color: isConfigured ? 'var(--accent-primary)' : '#F59E0B' }} />
-          <span>{isConfigured ? 'Cloud Connected' : 'Connect Supabase'}</span>
-        </button>
+        {showDevOverride && (
+          <button
+            type="button"
+            onClick={() => setConfigOpen(true)}
+            className="min-h-[44px] px-3.5 py-2 rounded-xl border border-white/10 bg-white/[0.03] text-xs font-medium text-zinc-300 hover:text-white inline-flex items-center gap-2 whitespace-nowrap shrink-0"
+          >
+            <Database className="w-3.5 h-3.5 text-amber-400" />
+            <span>Dev: Connect Supabase</span>
+          </button>
+        )}
       </header>
 
       {/* Main Split Hero */}
@@ -136,7 +140,9 @@ export function WelcomeScreen() {
         <span>Android Capacitor Edition</span>
       </footer>
 
-      <CloudConfigModal open={configOpen} onClose={() => setConfigOpen(false)} />
+      {showDevOverride && (
+        <CloudConfigModal open={configOpen} onClose={() => setConfigOpen(false)} />
+      )}
     </div>
   );
 }

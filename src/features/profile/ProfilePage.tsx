@@ -610,13 +610,15 @@ export function ProfilePage() {
                 <KeyRound className="w-4 h-4" />
                 Send Password Reset Email
               </SecondaryButton>
-              <SecondaryButton
-                onClick={() => setCloudModalOpen(true)}
-                className="w-full justify-start"
-              >
-                <Database className="w-4 h-4" />
-                Supabase Cloud Configuration
-              </SecondaryButton>
+              {import.meta.env.DEV && (
+                <SecondaryButton
+                  onClick={() => setCloudModalOpen(true)}
+                  className="w-full justify-start"
+                >
+                  <Database className="w-4 h-4" />
+                  Developer: Supabase Override
+                </SecondaryButton>
+              )}
               <SecondaryButton onClick={() => void signOut()} className="w-full justify-start">
                 <LogOut className="w-4 h-4" />
                 Sign Out of This Device
@@ -634,7 +636,9 @@ export function ProfilePage() {
         </div>
       </div>
 
-      <CloudConfigModal open={cloudModalOpen} onClose={() => setCloudModalOpen(false)} />
+      {import.meta.env.DEV && (
+        <CloudConfigModal open={cloudModalOpen} onClose={() => setCloudModalOpen(false)} />
+      )}
 
       <ModalSheet
         open={deleteModalOpen}

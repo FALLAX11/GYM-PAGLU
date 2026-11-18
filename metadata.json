@@ -1,0 +1,6 @@
+{
+  "name": "GYM PAGLU",
+  "description": "Your Fitness. Your Rules. Cloud-connected Android fitness application for strength training, nutrition tracking, body progress, and AI coaching.",
+  "requestFramePermissions": ["camera"],
+  "majorCapabilities": []
+}

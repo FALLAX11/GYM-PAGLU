@@ -1,0 +1,167 @@
+:root {
+  --sat: env(safe-area-inset-top, 0px);
+  --sab: env(safe-area-inset-bottom, 0px);
+  --sal: env(safe-area-inset-left, 0px);
+  --sar: env(safe-area-inset-right, 0px);
+
+  --bg-canvas: #08090B;
+  --bg-surface: #111318;
+  --bg-elevated: #181B22;
+  --bg-input: #0D0F13;
+  --border-subtle: rgba(255, 255, 255, 0.08);
+  --border-strong: rgba(255, 255, 255, 0.14);
+
+  --text-primary: #F4F5F7;
+  --text-secondary: #9CA3AF;
+  --text-muted: #6B7280;
+
+  --accent-primary: #C4F82A;
+  --accent-primary-hover: #D4FF4D;
+  --accent-fg: #08090B;
+  --accent-soft: rgba(196, 248, 42, 0.12);
+
+  --font-display: 'Outfit', system-ui, -apple-system, sans-serif;
+  --font-body: 'Plus Jakarta Sans', system-ui, -apple-system, sans-serif;
+  --font-mono: 'JetBrains Mono', ui-monospace, SFMono-Regular, monospace;
+}
+
+/* Theme Presets */
+[data-theme="obsidian"] {
+  --bg-canvas: #08090B;
+  --bg-surface: #111318;
+  --bg-elevated: #181B22;
+  --bg-input: #0D0F13;
+}
+
+[data-theme="carbon"] {
+  --bg-canvas: #0B0D10;
+  --bg-surface: #14171D;
+  --bg-elevated: #1D222B;
+  --bg-input: #0F1115;
+}
+
+[data-theme="midnight"] {
+  --bg-canvas: #060913;
+  --bg-surface: #0E1424;
+  --bg-elevated: #151E34;
+  --bg-input: #090D1B;
+}
+
+/* Base layout discipline */
+html,
+body,
+#root {
+  height: 100%;
+  min-height: 100%;
+  background-color: var(--bg-canvas);
+  color: var(--text-primary);
+  font-family: var(--font-body);
+  overscroll-behavior-y: contain;
+  -webkit-tap-highlight-color: transparent;
+}
+
+.font-display {
+  font-family: var(--font-display);
+}
+
+.font-mono-num {
+  font-family: var(--font-mono);
+  font-variant-numeric: tabular-nums;
+}
+
+.tabular-nums {
+  font-variant-numeric: tabular-nums;
+}
+
+/* Android System Bar & Safe-Area Shell Regions */
+.app-shell-root {
+  display: flex;
+  flex-direction: column;
+  height: 100dvh;
+  width: 100%;
+  background-color: var(--bg-canvas);
+  color: var(--text-primary);
+  overflow: hidden;
+}
+
+.app-system-bar {
+  flex-shrink: 0;
+  height: var(--sat);
+  width: 100%;
+  background-color: var(--bg-canvas);
+  z-index: 50;
+}
+
+.app-header-bar {
+  flex-shrink: 0;
+  height: 56px;
+  background-color: var(--bg-canvas);
+  border-bottom: 1px solid var(--border-subtle);
+  z-index: 40;
+}
+
+.app-scroll-region {
+  flex: 1 1 auto;
+  overflow-y: auto;
+  overflow-x: hidden;
+  -webkit-overflow-scrolling: touch;
+  padding-bottom: calc(76px + var(--sab) + 16px);
+}
+
+@media (min-width: 1024px) {
+  .app-scroll-region {
+    padding-bottom: 32px;
+  }
+}
+
+.app-bottom-nav {
+  position: fixed;
+  bottom: 0;
+  left: 0;
+  right: 0;
+  z-index: 45;
+  background-color: rgba(11, 13, 16, 0.94);
+  backdrop-filter: blur(16px);
+  -webkit-backdrop-filter: blur(16px);
+  border-top: 1px solid var(--border-subtle);
+  padding-bottom: var(--sab);
+  padding-left: var(--sal);
+  padding-right: var(--sar);
+}
+
+.safe-top-pad {
+  padding-top: var(--sat);
+}
+
+.safe-bottom-pad {
+  padding-bottom: var(--sab);
+}
+
+/* Custom subtle scrollbars */
+::-webkit-scrollbar {
+  width: 6px;
+  height: 6px;
+}
+
+::-webkit-scrollbar-track {
+  background: transparent;
+}
+
+::-webkit-scrollbar-thumb {
+  background: rgba(255, 255, 255, 0.12);
+  border-radius: 9999px;
+}
+
+::-webkit-scrollbar-thumb:hover {
+  background: rgba(255, 255, 255, 0.22);
+}
+
+@media (prefers-reduced-motion: reduce) {
+  *,
+  *::before,
+  *::after {
+    animation-duration: 0.01ms !important;
+    animation-iteration-count: 1 !important;
+    transition-duration: 0.01ms !important;
+  }
+}

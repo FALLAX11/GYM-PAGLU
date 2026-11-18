@@ -6,6 +6,10 @@
 --   - SECURITY INVOKER: respects all PostgreSQL Row Level Security policies.
 --   - Authenticates caller via auth.uid() and verifies p_user_id = auth.uid().
 --   - Never uses service-role credentials or bypasses RLS.
+--
+-- Hashing note:
+--   - Uses built-in pg_catalog.sha256(bytea) (available in PostgreSQL 11+; target is Supabase PostgreSQL 15+)
+--     so payload fingerprinting never fails due to pgcrypto schema placement (extensions vs public).
 
 -- Ensure Phase 1 columns and payload_hash exist idempotently on existing databases
 alter table public.workout_sessions
@@ -102,6 +106,8 @@ declare
 
   v_ex record;
   v_st record;
+  v_pex record;
+  v_pst record;
   v_ex_id uuid;
   v_raw_exercise_id text;
   v_raw_custom_exercise_id text;
@@ -177,7 +183,8 @@ begin
     end if;
   end if;
 
-  -- Validate every exercise, every sets array, and every set field, and build canonical fingerprint
+  -- Validate every exercise, every sets array, every set field, resolve canonical exercise identity,
+  -- and build the canonical payload representation used for fingerprinting, verification, and insertion.
   for v_ex in
     select elem, ord
     from jsonb_array_elements(p_exercises) with ordinality as t(elem, ord)
@@ -222,6 +229,63 @@ begin
     v_ex_rest_seconds := greatest(0, coalesce(nullif(btrim(coalesce(v_ex.elem->>'rest_seconds', '')), '')::integer, 90));
     v_ex_notes := btrim(coalesce(v_ex.elem->>'exercise_notes', ''));
     v_ex_superset := nullif(btrim(coalesce(v_ex.elem->>'superset_group', '')), '');
+
+    -- Deterministic exercise_id / custom_exercise_id resolution BEFORE hashing:
+    -- Synthetic a0000000-... catalog IDs and real public.exercises UUIDs resolve to the same canonical UUID
+    -- so retrying with synced real IDs never creates a false fingerprint mismatch.
+    v_resolved_exercise_id := null;
+    v_resolved_custom_exercise_id := null;
+
+    v_raw_custom_exercise_id := nullif(btrim(coalesce(v_ex.elem->>'custom_exercise_id', '')), '');
+    if v_raw_custom_exercise_id is not null
+       and v_raw_custom_exercise_id ~* '^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$' then
+      select ce.id into v_resolved_custom_exercise_id
+      from public.custom_exercises ce
+      where ce.id = v_raw_custom_exercise_id::uuid
+        and ce.user_id = v_auth_uid;
+    end if;
+
+    v_raw_exercise_id := nullif(btrim(coalesce(v_ex.elem->>'exercise_id', '')), '');
+    if v_resolved_custom_exercise_id is null
+       and v_raw_exercise_id is not null
+       and v_raw_exercise_id ~* '^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$'
+       and v_raw_exercise_id not ilike 'a0000000-%' then
+      select e.id into v_resolved_exercise_id
+      from public.exercises e
+      where e.id = v_raw_exercise_id::uuid;
+    end if;
+
+    if v_resolved_exercise_id is null and v_resolved_custom_exercise_id is null then
+      select count(*)::integer, min(e.id::text)::uuid
+      into v_name_match_count, v_matched_ex_id
+      from public.exercises e
+      where lower(btrim(e.name)) = lower(v_ex_name);
+
+      if v_name_match_count = 1 then
+        v_resolved_exercise_id := v_matched_ex_id;
+      elsif v_name_match_count > 1 then
+        select count(*)::integer, min(e.id::text)::uuid
+        into v_name_match_count, v_matched_ex_id
+        from public.exercises e
+        where btrim(e.name) = v_ex_name;
+
+        if v_name_match_count = 1 then
+          v_resolved_exercise_id := v_matched_ex_id;
+        end if;
+      end if;
+
+      if v_resolved_exercise_id is null then
+        select count(*)::integer, min(ce.id::text)::uuid
+        into v_name_match_count, v_matched_ex_id
+        from public.custom_exercises ce
+        where ce.user_id = v_auth_uid
+          and lower(btrim(ce.name)) = lower(v_ex_name);
+
+        if v_name_match_count = 1 then
+          v_resolved_custom_exercise_id := v_matched_ex_id;
+        end if;
+      end if;
+    end if;
 
     v_seen_set_numbers := '{}'::integer[];
     v_canonical_sets := '[]'::jsonb;
@@ -305,6 +369,8 @@ begin
     v_canonical_exercises := v_canonical_exercises || jsonb_build_array(
       jsonb_build_object(
         'sort_order', v_ex_sort_order,
+        'exercise_id', case when v_resolved_exercise_id is not null then v_resolved_exercise_id::text else null end,
+        'custom_exercise_id', case when v_resolved_custom_exercise_id is not null then v_resolved_custom_exercise_id::text else null end,
         'exercise_name', v_ex_name,
         'exercise_category', v_ex_category,
         'rest_seconds', v_ex_rest_seconds,
@@ -317,9 +383,9 @@ begin
 
   v_total_volume_kg := round(coalesce(v_total_volume_kg, 0)::numeric, 2)::numeric(12,2);
 
-  -- Deterministic SHA-256 fingerprint of the complete canonical workout payload (including ended_at & duration_seconds)
+  -- Deterministic SHA-256 fingerprint using core pg_catalog.sha256(bytea) (PostgreSQL 11+)
   v_payload_hash := encode(
-    sha256(
+    pg_catalog.sha256(
       convert_to(
         jsonb_build_object(
           'user_id', v_auth_uid::text,
@@ -377,6 +443,20 @@ begin
     and ws.client_request_id = p_client_request_id;
 
   if v_existing_id is not null then
+    -- Preserve any non-completed record (e.g. legacy/external status = 'in_progress') unconditionally:
+    -- save_workout_session_atomic only ever writes status = 'completed', so an 'in_progress' row
+    -- cannot be positively identified as a failed partial save from this RPC/legacy save flow.
+    if v_existing_status <> 'completed' then
+      raise exception 'Idempotency conflict: existing workout for client_request_id (%) has status "%" and cannot be replaced automatically.', p_client_request_id, v_existing_status
+        using errcode = '23505';
+    end if;
+
+    -- If payload_hash exists and differs, reject conflicting reuse of client_request_id immediately
+    if v_existing_payload_hash is not null and v_existing_payload_hash <> v_payload_hash then
+      raise exception 'Idempotency conflict: client_request_id (%) already belongs to a different workout payload.', p_client_request_id
+        using errcode = '23505';
+    end if;
+
     select
       count(wse.id)::integer,
       count(distinct wse.sort_order)::integer
@@ -428,12 +508,6 @@ begin
       )
     );
 
-    -- If payload_hash exists and differs, reject conflicting reuse of client_request_id immediately
-    if v_existing_payload_hash is not null and v_existing_payload_hash <> v_payload_hash then
-      raise exception 'Idempotency conflict: client_request_id (%) already belongs to a different workout payload.', p_client_request_id
-        using errcode = '23505';
-    end if;
-
     -- Strict full parent + child verification against the submitted payload
     v_existing_matches_payload := (
       v_existing_parent_matches
@@ -455,6 +529,16 @@ begin
           or wse.rest_seconds <> (pex.elem->>'rest_seconds')::integer
           or coalesce(wse.exercise_notes, '') <> (pex.elem->>'exercise_notes')
           or nullif(btrim(coalesce(wse.superset_group, '')), '') is distinct from nullif(pex.elem->>'superset_group', '')
+          or (
+            case
+              when v_existing_payload_hash is not null then
+                wse.exercise_id is distinct from nullif(pex.elem->>'exercise_id', '')::uuid
+                or wse.custom_exercise_id is distinct from nullif(pex.elem->>'custom_exercise_id', '')::uuid
+              else
+                (wse.exercise_id is not null and wse.exercise_id is distinct from nullif(pex.elem->>'exercise_id', '')::uuid)
+                or (wse.custom_exercise_id is not null and wse.custom_exercise_id is distinct from nullif(pex.elem->>'custom_exercise_id', '')::uuid)
+            end
+          )
           or (
             select count(*)
             from public.workout_sets wst
@@ -586,11 +670,12 @@ begin
     end if;
 
     -- Positive identification required before cleaning up any existing session:
-    -- 1. All persisted parent fields must match the retry payload.
+    -- 1. All persisted parent fields must match the retry payload (including status = 'completed').
     -- 2. The existing DB state must be positively verified as an incomplete partial save.
     -- 3. No duplicate sort_orders or set_numbers exist in DB.
     -- 4. Every persisted exercise and set record must be an exact matching subset of the retry payload
-    --    across all persisted columns (category, rest_seconds, notes, superset_group, set_type, rpe, etc.).
+    --    across all persisted columns (exercise_id, custom_exercise_id, category, rest_seconds, notes,
+    --    superset_group, set_type, rpe, etc.).
     v_is_incomplete_partial_save := (
       v_existing_ex_count = 0
       or not v_existing_structurally_complete
@@ -619,6 +704,16 @@ begin
               and (pex.elem->>'rest_seconds')::integer = wse.rest_seconds
               and (pex.elem->>'exercise_notes') = coalesce(wse.exercise_notes, '')
               and nullif(pex.elem->>'superset_group', '') is not distinct from nullif(btrim(coalesce(wse.superset_group, '')), '')
+              and (
+                case
+                  when v_existing_payload_hash is not null then
+                    wse.exercise_id is not distinct from nullif(pex.elem->>'exercise_id', '')::uuid
+                    and wse.custom_exercise_id is not distinct from nullif(pex.elem->>'custom_exercise_id', '')::uuid
+                  else
+                    (wse.exercise_id is null or wse.exercise_id is not distinct from nullif(pex.elem->>'exercise_id', '')::uuid)
+                    and (wse.custom_exercise_id is null or wse.custom_exercise_id is not distinct from nullif(pex.elem->>'custom_exercise_id', '')::uuid)
+                end
+              )
               and (
                 select count(*)
                 from public.workout_sets wst
@@ -705,76 +800,12 @@ begin
   )
   returning id into v_session_id;
 
-  -- 6. Insert every validated exercise and every child set within the same transaction
-  for v_ex in
-    select elem, ord
-    from jsonb_array_elements(p_exercises) with ordinality as t(elem, ord)
-    order by ord asc
+  -- 6. Insert every canonicalized exercise and child set within the same transaction
+  for v_pex in
+    select elem
+    from jsonb_array_elements(v_canonical_exercises) as t(elem)
+    order by (elem->>'sort_order')::integer asc
   loop
-    v_ex_name := nullif(btrim(coalesce(v_ex.elem->>'exercise_name', '')), '');
-    v_ex_category := coalesce(nullif(btrim(coalesce(v_ex.elem->>'exercise_category', '')), ''), 'Full body');
-    v_ex_sort_order := coalesce(nullif(btrim(coalesce(v_ex.elem->>'sort_order', '')), '')::integer, v_ex.ord::integer);
-    v_ex_rest_seconds := greatest(0, coalesce(nullif(btrim(coalesce(v_ex.elem->>'rest_seconds', '')), '')::integer, 90));
-    v_ex_notes := btrim(coalesce(v_ex.elem->>'exercise_notes', ''));
-    v_ex_superset := nullif(btrim(coalesce(v_ex.elem->>'superset_group', '')), '');
-
-    -- Deterministic exercise_id / custom_exercise_id resolution
-    v_resolved_exercise_id := null;
-    v_resolved_custom_exercise_id := null;
-
-    v_raw_custom_exercise_id := nullif(btrim(coalesce(v_ex.elem->>'custom_exercise_id', '')), '');
-    if v_raw_custom_exercise_id is not null
-       and v_raw_custom_exercise_id ~* '^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$' then
-      select ce.id into v_resolved_custom_exercise_id
-      from public.custom_exercises ce
-      where ce.id = v_raw_custom_exercise_id::uuid
-        and ce.user_id = v_auth_uid;
-    end if;
-
-    v_raw_exercise_id := nullif(btrim(coalesce(v_ex.elem->>'exercise_id', '')), '');
-    if v_resolved_custom_exercise_id is null
-       and v_raw_exercise_id is not null
-       and v_raw_exercise_id ~* '^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$'
-       and v_raw_exercise_id not ilike 'a0000000-%' then
-      select e.id into v_resolved_exercise_id
-      from public.exercises e
-      where e.id = v_raw_exercise_id::uuid;
-    end if;
-
-    -- Deterministic name resolution when no direct DB UUID matched (e.g. synthetic a0000000-... catalog ID):
-    -- Only associate when an exact match is unambiguous (count = 1). Never pick an arbitrary row on duplicates.
-    if v_resolved_exercise_id is null and v_resolved_custom_exercise_id is null then
-      select count(*)::integer, min(e.id::text)::uuid
-      into v_name_match_count, v_matched_ex_id
-      from public.exercises e
-      where lower(btrim(e.name)) = lower(v_ex_name);
-
-      if v_name_match_count = 1 then
-        v_resolved_exercise_id := v_matched_ex_id;
-      elsif v_name_match_count > 1 then
-        select count(*)::integer, min(e.id::text)::uuid
-        into v_name_match_count, v_matched_ex_id
-        from public.exercises e
-        where btrim(e.name) = v_ex_name;
-
-        if v_name_match_count = 1 then
-          v_resolved_exercise_id := v_matched_ex_id;
-        end if;
-      end if;
-
-      if v_resolved_exercise_id is null then
-        select count(*)::integer, min(ce.id::text)::uuid
-        into v_name_match_count, v_matched_ex_id
-        from public.custom_exercises ce
-        where ce.user_id = v_auth_uid
-          and lower(btrim(ce.name)) = lower(v_ex_name);
-
-        if v_name_match_count = 1 then
-          v_resolved_custom_exercise_id := v_matched_ex_id;
-        end if;
-      end if;
-    end if;
-
     insert into public.workout_session_exercises (
       user_id,
       session_id,
@@ -790,38 +821,22 @@ begin
     values (
       v_auth_uid,
       v_session_id,
-      v_resolved_exercise_id,
-      v_resolved_custom_exercise_id,
-      v_ex_name,
-      v_ex_category,
-      v_ex_sort_order,
-      v_ex_rest_seconds,
-      v_ex_notes,
-      v_ex_superset
+      nullif(v_pex.elem->>'exercise_id', '')::uuid,
+      nullif(v_pex.elem->>'custom_exercise_id', '')::uuid,
+      v_pex.elem->>'exercise_name',
+      v_pex.elem->>'exercise_category',
+      (v_pex.elem->>'sort_order')::integer,
+      (v_pex.elem->>'rest_seconds')::integer,
+      v_pex.elem->>'exercise_notes',
+      nullif(v_pex.elem->>'superset_group', '')
     )
     returning id into v_ex_id;
 
-    for v_st in
-      select elem, ord
-      from jsonb_array_elements(v_ex.elem->'sets') with ordinality as s(elem, ord)
-      order by ord asc
+    for v_pst in
+      select elem
+      from jsonb_array_elements(v_pex.elem->'sets') as s(elem)
+      order by (elem->>'set_number')::integer asc
     loop
-      v_set_number := coalesce(nullif(btrim(coalesce(v_st.elem->>'set_number', '')), '')::integer, v_st.ord::integer);
-      v_weight_kg := round(coalesce(nullif(btrim(coalesce(v_st.elem->>'weight_kg', '')), '')::numeric, 0), 2)::numeric(7,2);
-      v_reps := coalesce(round(nullif(btrim(coalesce(v_st.elem->>'reps', '')), '')::numeric)::integer, 0);
-      v_is_completed := coalesce((v_st.elem->>'is_completed')::boolean, false);
-      v_set_rest_seconds := greatest(
-        0,
-        coalesce(nullif(btrim(coalesce(v_st.elem->>'rest_seconds', '')), '')::integer, v_ex_rest_seconds, 90)
-      );
-      v_set_type := coalesce(nullif(btrim(coalesce(v_st.elem->>'set_type', '')), ''), 'normal');
-
-      if v_st.elem ? 'rpe' and nullif(btrim(coalesce(v_st.elem->>'rpe', '')), '') is not null then
-        v_rpe := round((v_st.elem->>'rpe')::numeric, 1)::numeric(3,1);
-      else
-        v_rpe := null;
-      end if;
-
       insert into public.workout_sets (
         user_id,
         session_exercise_id,
@@ -836,13 +851,16 @@ begin
       values (
         v_auth_uid,
         v_ex_id,
-        v_set_number,
-        v_weight_kg,
-        v_reps,
-        v_is_completed,
-        v_set_rest_seconds,
-        v_set_type,
-        v_rpe
+        (v_pst.elem->>'set_number')::integer,
+        (v_pst.elem->>'weight_kg')::numeric(7,2),
+        (v_pst.elem->>'reps')::integer,
+        (v_pst.elem->>'is_completed')::boolean,
+        (v_pst.elem->>'rest_seconds')::integer,
+        v_pst.elem->>'set_type',
+        case
+          when v_pst.elem->>'rpe' is not null then (v_pst.elem->>'rpe')::numeric(3,1)
+          else null
+        end
       );
     end loop;
   end loop;

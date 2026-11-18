@@ -763,6 +763,7 @@ export async function saveWorkoutSession(
       const retSets = retEx.workout_sets ?? [];
       return (
         retEx.sort_order === expEx.sort_order &&
+        retEx.exercise_name === expEx.exercise_name &&
         retSets.length === expEx.sets.length &&
         retSets.every((retSet, sIdx) => retSet.set_number === expEx.sets[sIdx].set_number)
       );

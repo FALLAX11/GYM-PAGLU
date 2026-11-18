@@ -690,16 +690,22 @@ export async function saveWorkoutSession(
     superset_group: ex.superset_group ?? null,
     sets: ex.sets.map((s, sIdx) => ({
       set_number: sIdx + 1,
-      weight_kg: Number(s.weight_kg) || 0,
+      weight_kg: Math.round(Math.max(0, Number(s.weight_kg) || 0) * 100) / 100,
       reps: Math.max(0, Math.round(Number(s.reps) || 0)),
       is_completed: Boolean(s.is_completed),
       rest_seconds: Math.max(0, Math.round(Number(s.rest_seconds || ex.rest_seconds || 90))),
       set_type: s.set_type ?? 'normal',
-      rpe: typeof s.rpe === 'number' ? s.rpe : null,
+      rpe:
+        typeof s.rpe === 'number' && Number.isFinite(s.rpe)
+          ? Math.round(s.rpe * 10) / 10
+          : null,
     })),
   }));
 
   const expectedSetCount = exercisesPayload.reduce((sum, ex) => sum + ex.sets.length, 0);
+
+  const normalizedStartedAt = new Date(payload.started_at).toISOString();
+  const normalizedEndedAt = payload.ended_at ? new Date(payload.ended_at).toISOString() : null;
 
   const { data, error: rpcErr } = await supabase.rpc('save_workout_session_atomic', {
     p_user_id: userId,
@@ -707,8 +713,8 @@ export async function saveWorkoutSession(
     p_plan_id: isUuidLike(payload.plan_id) ? payload.plan_id : null,
     p_workout_name: payload.workout_name.trim() || 'Training Session',
     p_workout_date: payload.workout_date,
-    p_started_at: payload.started_at,
-    p_ended_at: payload.ended_at,
+    p_started_at: normalizedStartedAt,
+    p_ended_at: normalizedEndedAt,
     p_duration_seconds: Math.max(0, Math.round(payload.duration_seconds)),
     p_session_notes: payload.session_notes.trim(),
     p_exercises: exercisesPayload,

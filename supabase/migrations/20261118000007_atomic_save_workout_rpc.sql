@@ -61,6 +61,7 @@ declare
   v_workout_name text;
   v_workout_date date;
   v_started_at timestamptz;
+  v_ended_at timestamptz;
   v_session_notes text;
   v_duration_seconds integer;
 
@@ -74,12 +75,26 @@ declare
   v_payload_hash text;
 
   v_existing_id uuid;
+  v_existing_plan_id uuid;
+  v_existing_workout_name text;
+  v_existing_workout_date date;
+  v_existing_started_at timestamptz;
+  v_existing_ended_at timestamptz;
+  v_existing_duration_seconds integer;
+  v_existing_session_notes text;
   v_existing_status text;
   v_existing_payload_hash text;
+
   v_existing_ex_count integer := 0;
+  v_existing_distinct_ex_orders integer := 0;
   v_existing_set_count integer := 0;
+  v_existing_distinct_set_pairs integer := 0;
+
+  v_existing_parent_matches boolean := false;
   v_existing_structurally_complete boolean := false;
   v_existing_matches_payload boolean := false;
+  v_is_incomplete_partial_save boolean := false;
+  v_legacy_subset_valid boolean := false;
 
   v_valid_plan_id uuid := null;
   v_session_id uuid;
@@ -102,11 +117,14 @@ declare
   v_ex_superset text;
 
   v_set_number integer;
+  v_weight_num numeric;
   v_weight_kg numeric(7,2);
+  v_reps_num numeric;
   v_reps integer;
   v_is_completed boolean;
   v_set_rest_seconds integer;
   v_set_type text;
+  v_rpe_num numeric;
   v_rpe numeric(3,1);
 
   v_result jsonb;
@@ -132,6 +150,7 @@ begin
   v_workout_name := coalesce(nullif(btrim(p_workout_name), ''), 'Training Session');
   v_workout_date := coalesce(p_workout_date, current_date);
   v_started_at := coalesce(p_started_at, timezone('utc', now()));
+  v_ended_at := p_ended_at;
   v_session_notes := btrim(coalesce(p_session_notes, ''));
   v_duration_seconds := greatest(0, coalesce(p_duration_seconds, 0));
 
@@ -188,8 +207,9 @@ begin
     end if;
 
     v_ex_category := coalesce(nullif(btrim(coalesce(v_ex.elem->>'exercise_category', '')), ''), 'Full body');
+    -- Frontend workoutService.ts sends 1-based sort_order (idx + 1); schema permits non-negative integers (>= 0).
     v_ex_sort_order := coalesce(nullif(btrim(coalesce(v_ex.elem->>'sort_order', '')), '')::integer, v_ex.ord::integer);
-    if v_ex_sort_order < 1 then
+    if v_ex_sort_order < 0 then
       raise exception 'Exercise "%" has invalid sort_order (%).', v_ex_name, v_ex_sort_order
         using errcode = '22023';
     end if;
@@ -227,17 +247,19 @@ begin
       end if;
       v_seen_set_numbers := array_append(v_seen_set_numbers, v_set_number);
 
-      v_weight_kg := coalesce(nullif(btrim(coalesce(v_st.elem->>'weight_kg', '')), '')::numeric, 0)::numeric(7,2);
-      if v_weight_kg < 0 or v_weight_kg > 1000 then
-        raise exception 'Set % weight (%) for "%" must be between 0 and 1000 kg.', v_set_number, v_weight_kg, v_ex_name
+      v_weight_num := coalesce(nullif(btrim(coalesce(v_st.elem->>'weight_kg', '')), '')::numeric, 0);
+      if v_weight_num < 0 or v_weight_num > 1000 then
+        raise exception 'Set % weight (%) for "%" must be between 0 and 1000 kg.', v_set_number, v_weight_num, v_ex_name
           using errcode = '22023';
       end if;
+      v_weight_kg := round(v_weight_num, 2)::numeric(7,2);
 
-      v_reps := coalesce(round(nullif(btrim(coalesce(v_st.elem->>'reps', '')), '')::numeric)::integer, 0);
-      if v_reps < 0 or v_reps > 500 then
-        raise exception 'Set % reps (%) for "%" must be between 0 and 500.', v_set_number, v_reps, v_ex_name
+      v_reps_num := coalesce(round(nullif(btrim(coalesce(v_st.elem->>'reps', '')), '')::numeric), 0);
+      if v_reps_num < 0 or v_reps_num > 500 then
+        raise exception 'Set % reps (%) for "%" must be between 0 and 500.', v_set_number, v_reps_num, v_ex_name
           using errcode = '22023';
       end if;
+      v_reps := v_reps_num::integer;
 
       v_is_completed := coalesce((v_st.elem->>'is_completed')::boolean, false);
       v_set_rest_seconds := greatest(
@@ -251,11 +273,12 @@ begin
       end if;
 
       if v_st.elem ? 'rpe' and nullif(btrim(coalesce(v_st.elem->>'rpe', '')), '') is not null then
-        v_rpe := (v_st.elem->>'rpe')::numeric(3,1);
-        if v_rpe < 1 or v_rpe > 10 then
-          raise exception 'RPE (%) on set % of "%" must be between 1 and 10.', v_rpe, v_set_number, v_ex_name
+        v_rpe_num := round((v_st.elem->>'rpe')::numeric, 1);
+        if v_rpe_num < 1 or v_rpe_num > 10 then
+          raise exception 'RPE (%) on set % of "%" must be between 1 and 10.', v_rpe_num, v_set_number, v_ex_name
             using errcode = '22023';
         end if;
+        v_rpe := v_rpe_num::numeric(3,1);
       else
         v_rpe := null;
       end if;
@@ -269,12 +292,12 @@ begin
       v_canonical_sets := v_canonical_sets || jsonb_build_array(
         jsonb_build_object(
           'set_number', v_set_number,
-          'weight_kg', v_weight_kg,
+          'weight_kg', to_char(v_weight_kg, 'FM999990.00'),
           'reps', v_reps,
           'is_completed', v_is_completed,
           'rest_seconds', v_set_rest_seconds,
           'set_type', v_set_type,
-          'rpe', v_rpe
+          'rpe', case when v_rpe is not null then to_char(v_rpe, 'FM90.0') else null end
         )
       );
     end loop;
@@ -294,17 +317,23 @@ begin
 
   v_total_volume_kg := round(coalesce(v_total_volume_kg, 0)::numeric, 2)::numeric(12,2);
 
-  -- Deterministic SHA-256 fingerprint of the canonical workout content
+  -- Deterministic SHA-256 fingerprint of the complete canonical workout payload (including ended_at & duration_seconds)
   v_payload_hash := encode(
     sha256(
       convert_to(
         jsonb_build_object(
-          'user_id', v_auth_uid,
-          'client_request_id', p_client_request_id,
-          'plan_id', v_valid_plan_id,
+          'user_id', v_auth_uid::text,
+          'client_request_id', p_client_request_id::text,
+          'plan_id', case when v_valid_plan_id is not null then v_valid_plan_id::text else null end,
           'workout_name', v_workout_name,
-          'workout_date', v_workout_date,
-          'started_at', v_started_at,
+          'workout_date', to_char(v_workout_date, 'YYYY-MM-DD'),
+          'started_at', to_char(v_started_at at time zone 'UTC', 'YYYY-MM-DD"T"HH24:MI:SS.US"Z"'),
+          'ended_at', case
+            when v_ended_at is not null
+              then to_char(v_ended_at at time zone 'UTC', 'YYYY-MM-DD"T"HH24:MI:SS.US"Z"')
+            else null
+          end,
+          'duration_seconds', v_duration_seconds,
           'session_notes', v_session_notes,
           'exercises', v_canonical_exercises
         )::text,
@@ -321,29 +350,70 @@ begin
   );
 
   -- 4. Inspect any existing session for this client_request_id
-  select ws.id, ws.status, ws.payload_hash
-  into v_existing_id, v_existing_status, v_existing_payload_hash
+  select
+    ws.id,
+    ws.plan_id,
+    ws.workout_name,
+    ws.workout_date,
+    ws.started_at,
+    ws.ended_at,
+    ws.duration_seconds,
+    ws.session_notes,
+    ws.status,
+    ws.payload_hash
+  into
+    v_existing_id,
+    v_existing_plan_id,
+    v_existing_workout_name,
+    v_existing_workout_date,
+    v_existing_started_at,
+    v_existing_ended_at,
+    v_existing_duration_seconds,
+    v_existing_session_notes,
+    v_existing_status,
+    v_existing_payload_hash
   from public.workout_sessions ws
   where ws.user_id = v_auth_uid
     and ws.client_request_id = p_client_request_id;
 
   if v_existing_id is not null then
     select
-      count(distinct wse.id)::integer,
-      count(wst.id)::integer
-    into v_existing_ex_count, v_existing_set_count
+      count(wse.id)::integer,
+      count(distinct wse.sort_order)::integer
+    into v_existing_ex_count, v_existing_distinct_ex_orders
     from public.workout_session_exercises wse
-    left join public.workout_sets wst
-      on wst.session_exercise_id = wse.id
-      and wst.user_id = v_auth_uid
     where wse.session_id = v_existing_id
       and wse.user_id = v_auth_uid;
+
+    select
+      count(wst.id)::integer,
+      count(distinct (wst.session_exercise_id::text || ':' || wst.set_number::text))::integer
+    into v_existing_set_count, v_existing_distinct_set_pairs
+    from public.workout_sets wst
+    join public.workout_session_exercises wse
+      on wse.id = wst.session_exercise_id
+      and wse.session_id = v_existing_id
+      and wse.user_id = v_auth_uid
+    where wst.user_id = v_auth_uid;
+
+    v_existing_parent_matches := (
+      v_existing_status = 'completed'
+      and v_existing_plan_id is not distinct from v_valid_plan_id
+      and v_existing_workout_name = v_workout_name
+      and v_existing_workout_date = v_workout_date
+      and v_existing_started_at = v_started_at
+      and v_existing_ended_at is not distinct from v_ended_at
+      and v_existing_duration_seconds = v_duration_seconds
+      and coalesce(v_existing_session_notes, '') = v_session_notes
+    );
 
     -- Determine whether the existing DB record is structurally complete on its own
     v_existing_structurally_complete := (
       v_existing_status = 'completed'
       and v_existing_ex_count > 0
       and v_existing_set_count > 0
+      and v_existing_ex_count = v_existing_distinct_ex_orders
+      and v_existing_set_count = v_existing_distinct_set_pairs
       and not exists (
         select 1
         from public.workout_session_exercises wse
@@ -358,26 +428,21 @@ begin
       )
     );
 
-    -- If payload_hash exists and differs, reject conflicting reuse of client_request_id
+    -- If payload_hash exists and differs, reject conflicting reuse of client_request_id immediately
     if v_existing_payload_hash is not null and v_existing_payload_hash <> v_payload_hash then
-      if v_existing_structurally_complete then
-        raise exception 'Idempotency conflict: client_request_id (%) already belongs to a different completed workout.', p_client_request_id
-          using errcode = '23505';
-      else
-        raise exception 'Idempotency conflict: client_request_id (%) does not match the payload of the existing session.', p_client_request_id
-          using errcode = '23505';
-      end if;
+      raise exception 'Idempotency conflict: client_request_id (%) already belongs to a different workout payload.', p_client_request_id
+        using errcode = '23505';
     end if;
 
-    -- Strict structural verification against the submitted payload:
-    -- exact exercise count, exact total set count, exact sort_order & exercise_name,
-    -- exact per-exercise set count, exact set_number sequence & values, no missing or extra rows.
+    -- Strict full parent + child verification against the submitted payload
     v_existing_matches_payload := (
-      v_existing_status = 'completed'
+      v_existing_parent_matches
       and v_existing_ex_count = v_expected_ex_count
+      and v_existing_distinct_ex_orders = v_expected_ex_count
       and v_existing_set_count = v_expected_set_count
+      and v_existing_distinct_set_pairs = v_expected_set_count
       and not exists (
-        -- Any expected exercise missing or mismatched in DB
+        -- Any expected exercise missing or mismatched across any persisted column
         select 1
         from jsonb_array_elements(v_canonical_exercises) as pex(elem)
         left join public.workout_session_exercises wse
@@ -386,6 +451,10 @@ begin
           and wse.sort_order = (pex.elem->>'sort_order')::integer
         where wse.id is null
           or wse.exercise_name <> (pex.elem->>'exercise_name')
+          or wse.exercise_category <> (pex.elem->>'exercise_category')
+          or wse.rest_seconds <> (pex.elem->>'rest_seconds')::integer
+          or coalesce(wse.exercise_notes, '') <> (pex.elem->>'exercise_notes')
+          or nullif(btrim(coalesce(wse.superset_group, '')), '') is distinct from nullif(pex.elem->>'superset_group', '')
           or (
             select count(*)
             from public.workout_sets wst
@@ -393,7 +462,7 @@ begin
               and wst.user_id = v_auth_uid
           ) <> jsonb_array_length(pex.elem->'sets')
           or exists (
-            -- Any expected set missing or mismatched
+            -- Any expected set missing or mismatched across any persisted column
             select 1
             from jsonb_array_elements(pex.elem->'sets') as pst(elem)
             left join public.workout_sets wst
@@ -404,6 +473,7 @@ begin
               or wst.weight_kg <> (pst.elem->>'weight_kg')::numeric(7,2)
               or wst.reps <> (pst.elem->>'reps')::integer
               or wst.is_completed <> (pst.elem->>'is_completed')::boolean
+              or wst.rest_seconds <> (pst.elem->>'rest_seconds')::integer
               or wst.set_type <> (pst.elem->>'set_type')
               or wst.rpe is distinct from (
                 case
@@ -515,17 +585,27 @@ begin
       return v_result;
     end if;
 
-    -- Never delete a structurally complete existing workout when a different payload is submitted
-    if v_existing_structurally_complete and v_existing_ex_count >= v_expected_ex_count then
-      raise exception 'Idempotency conflict: client_request_id (%) already belongs to a completed workout with different content.', p_client_request_id
-        using errcode = '23505';
-    end if;
+    -- Positive identification required before cleaning up any existing session:
+    -- 1. All persisted parent fields must match the retry payload.
+    -- 2. The existing DB state must be positively verified as an incomplete partial save.
+    -- 3. No duplicate sort_orders or set_numbers exist in DB.
+    -- 4. Every persisted exercise and set record must be an exact matching subset of the retry payload
+    --    across all persisted columns (category, rest_seconds, notes, superset_group, set_type, rpe, etc.).
+    v_is_incomplete_partial_save := (
+      v_existing_ex_count = 0
+      or not v_existing_structurally_complete
+      or v_existing_ex_count < v_expected_ex_count
+      or v_existing_set_count < v_expected_set_count
+    );
 
-    if v_existing_structurally_complete and v_existing_payload_hash is null then
-      -- Legacy completed row whose exercises/sets do not match the submitted payload:
-      -- only treat as an incomplete legacy save if existing exercises and sets are a strict subset
-      -- (i.e. missing trailing exercises/sets from a mid-loop crash); otherwise reject.
-      if exists (
+    v_legacy_subset_valid := (
+      v_existing_parent_matches
+      and v_is_incomplete_partial_save
+      and v_existing_ex_count <= v_expected_ex_count
+      and v_existing_set_count <= v_expected_set_count
+      and v_existing_ex_count = v_existing_distinct_ex_orders
+      and v_existing_set_count = v_existing_distinct_set_pairs
+      and not exists (
         select 1
         from public.workout_session_exercises wse
         where wse.session_id = v_existing_id
@@ -535,6 +615,16 @@ begin
             from jsonb_array_elements(v_canonical_exercises) as pex(elem)
             where (pex.elem->>'sort_order')::integer = wse.sort_order
               and (pex.elem->>'exercise_name') = wse.exercise_name
+              and (pex.elem->>'exercise_category') = wse.exercise_category
+              and (pex.elem->>'rest_seconds')::integer = wse.rest_seconds
+              and (pex.elem->>'exercise_notes') = coalesce(wse.exercise_notes, '')
+              and nullif(pex.elem->>'superset_group', '') is not distinct from nullif(btrim(coalesce(wse.superset_group, '')), '')
+              and (
+                select count(*)
+                from public.workout_sets wst
+                where wst.session_exercise_id = wse.id
+                  and wst.user_id = v_auth_uid
+              ) <= jsonb_array_length(pex.elem->'sets')
               and not exists (
                 select 1
                 from public.workout_sets wst
@@ -547,17 +637,27 @@ begin
                       and wst.weight_kg = (pst.elem->>'weight_kg')::numeric(7,2)
                       and wst.reps = (pst.elem->>'reps')::integer
                       and wst.is_completed = (pst.elem->>'is_completed')::boolean
+                      and wst.rest_seconds = (pst.elem->>'rest_seconds')::integer
+                      and wst.set_type = (pst.elem->>'set_type')
+                      and wst.rpe is not distinct from (
+                        case
+                          when pst.elem->>'rpe' is not null then (pst.elem->>'rpe')::numeric(3,1)
+                          else null
+                        end
+                      )
                   )
               )
           )
-      ) then
-        raise exception 'Idempotency conflict: client_request_id (%) already belongs to a different completed workout.', p_client_request_id
-          using errcode = '23505';
-      end if;
+      )
+    );
+
+    if not v_legacy_subset_valid then
+      raise exception 'Idempotency conflict: existing workout for client_request_id (%) cannot be safely replaced because it does not match the retry payload.', p_client_request_id
+        using errcode = '23505';
     end if;
 
-    -- Safe cleanup of incomplete legacy session: delete child sets -> exercises -> parent explicitly
-    -- without relying on ON DELETE CASCADE, inside this same atomic transaction.
+    -- Safe cleanup of positively verified incomplete partial save:
+    -- delete child sets -> exercises -> parent explicitly without relying on ON DELETE CASCADE.
     delete from public.workout_sets wst
     using public.workout_session_exercises wse
     where wst.session_exercise_id = wse.id
@@ -596,7 +696,7 @@ begin
     v_workout_name,
     v_workout_date,
     v_started_at,
-    p_ended_at,
+    v_ended_at,
     v_duration_seconds,
     v_total_volume_kg,
     v_session_notes,
@@ -652,7 +752,6 @@ begin
       if v_name_match_count = 1 then
         v_resolved_exercise_id := v_matched_ex_id;
       elsif v_name_match_count > 1 then
-        -- Disambiguate using exact case-sensitive trimmed match if unique
         select count(*)::integer, min(e.id::text)::uuid
         into v_name_match_count, v_matched_ex_id
         from public.exercises e
@@ -708,7 +807,7 @@ begin
       order by ord asc
     loop
       v_set_number := coalesce(nullif(btrim(coalesce(v_st.elem->>'set_number', '')), '')::integer, v_st.ord::integer);
-      v_weight_kg := coalesce(nullif(btrim(coalesce(v_st.elem->>'weight_kg', '')), '')::numeric, 0)::numeric(7,2);
+      v_weight_kg := round(coalesce(nullif(btrim(coalesce(v_st.elem->>'weight_kg', '')), '')::numeric, 0), 2)::numeric(7,2);
       v_reps := coalesce(round(nullif(btrim(coalesce(v_st.elem->>'reps', '')), '')::numeric)::integer, 0);
       v_is_completed := coalesce((v_st.elem->>'is_completed')::boolean, false);
       v_set_rest_seconds := greatest(
@@ -718,7 +817,7 @@ begin
       v_set_type := coalesce(nullif(btrim(coalesce(v_st.elem->>'set_type', '')), ''), 'normal');
 
       if v_st.elem ? 'rpe' and nullif(btrim(coalesce(v_st.elem->>'rpe', '')), '') is not null then
-        v_rpe := (v_st.elem->>'rpe')::numeric(3,1);
+        v_rpe := round((v_st.elem->>'rpe')::numeric, 1)::numeric(3,1);
       else
         v_rpe := null;
       end if;

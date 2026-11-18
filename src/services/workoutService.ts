@@ -664,6 +664,14 @@ export async function saveWorkoutSession(
   if (!payload.exercises || payload.exercises.length === 0) {
     throw new Error('Add at least one exercise before saving your workout.');
   }
+  for (const ex of payload.exercises) {
+    if (!ex.exercise_name || !ex.exercise_name.trim()) {
+      throw new Error('Every workout exercise must include a valid name.');
+    }
+    if (!Array.isArray(ex.sets) || ex.sets.length === 0) {
+      throw new Error(`Exercise "${ex.exercise_name}" must contain at least one set.`);
+    }
+  }
 
   // Keep Phase 1 rich metadata locally as a secondary cache for offline/legacy compatibility
   savePhase1SessionMeta(userId, payload.client_request_id, payload.exercises);
@@ -735,20 +743,34 @@ export async function saveWorkoutSession(
   }
 
   const normalized = normalizeWorkoutSessionRecord(data);
-  const returnedExCount = normalized.workout_session_exercises?.length ?? 0;
-  const returnedSetCount = (normalized.workout_session_exercises ?? []).reduce(
+  const returnedExercises = normalized.workout_session_exercises ?? [];
+  const returnedExCount = returnedExercises.length;
+  const returnedSetCount = returnedExercises.reduce(
     (sum, ex) => sum + (ex.workout_sets?.length ?? 0),
     0
   );
 
+  const perExerciseExactMatch =
+    returnedExCount === exercisesPayload.length &&
+    returnedExercises.every((retEx, idx) => {
+      const expEx = exercisesPayload[idx];
+      const retSets = retEx.workout_sets ?? [];
+      return (
+        retEx.sort_order === expEx.sort_order &&
+        retSets.length === expEx.sets.length &&
+        retSets.every((retSet, sIdx) => retSet.set_number === expEx.sets[sIdx].set_number)
+      );
+    });
+
   if (
     !normalized.id ||
     normalized.status !== 'completed' ||
-    returnedExCount < exercisesPayload.length ||
-    returnedSetCount < expectedSetCount
+    returnedExCount !== exercisesPayload.length ||
+    returnedSetCount !== expectedSetCount ||
+    !perExerciseExactMatch
   ) {
     throw new Error(
-      'Cloud write verification failed: incomplete workout hierarchy returned from database.'
+      'Cloud write verification failed: workout hierarchy returned from database does not match the submitted workout.'
     );
   }
 
